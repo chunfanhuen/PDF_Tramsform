@@ -15,43 +15,49 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 CONFIG = {
-    "translate_api": "microsoft",  # microsoft/baidu/deepl
-    "microsoft_key": "YOUR_KEY",
-    "microsoft_region": "YOUR_REGION",
-    "baidu_appid": "YOUR_APPID",
-    "baidu_secret": "YOUR_SECRET",
+    "translate_api": "baidu",  # microsoft/baidu/deepl
+    "baidu_appid": "",
+    "baidu_secret": "",
     "proxy": None,  # 例如："http://127.0.0.1:1080"
-    "max_workers": 4,
+    "max_workers": 2,
     "request_timeout": 15,
+    "baidu_max_length": 6000,
+    "request_timeout": (15, 30),
+    "retry_delay": 1.0,
+    "max_text_length": 4000
 }
 
 
-def split_text(text, max_length=4500):
-    """文本分割函数"""
-    paragraphs = []
-    current_para = []
+def split_text(text):
+    """改进的分割函数"""
+    # 添加编码长度校验
+    encoded_length = len(quote(text))
+    if encoded_length > CONFIG["baidu_max_length"]:
+        # 按实际编码长度分割
+        return split_by_encoded_length(text)
+    return [text]
+
+
+def split_by_encoded_length(text):
+    """按编码后长度分割"""
+    chunks = []
+    current_chunk = []
     current_length = 0
 
-    # 按句子分割，保留格式
-    sentences = re.split(r'(?<=\n)|(?<=。|\.|\!|\?|；|;)\s*', text)
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-
-        sentence_length = len(sentence)
-        if current_length + sentence_length > max_length and current_para:
-            paragraphs.append('\n'.join(current_para))
-            current_para = [sentence]
-            current_length = sentence_length
+    for char in text:
+        encoded_char = quote(char)
+        char_length = len(encoded_char)
+        if current_length + char_length > CONFIG["baidu_max_length"]:
+            chunks.append(''.join(current_chunk))
+            current_chunk = [char]
+            current_length = char_length
         else:
-            current_para.append(sentence)
-            current_length += sentence_length + 1
+            current_chunk.append(char)
+            current_length += char_length
 
-    if current_para:
-        paragraphs.append('\n'.join(current_para))
-    return paragraphs
+    if current_chunk:
+        chunks.append(''.join(current_chunk))
+    return chunks
 
 
 def translate_text(text, src_lang='en', target_lang='zh-CN', max_retries=3):
@@ -61,9 +67,7 @@ def translate_text(text, src_lang='en', target_lang='zh-CN', max_retries=3):
 
     for attempt in range(max_retries):
         try:
-            if CONFIG["translate_api"] == "microsoft":
-                return translate_microsoft(text, src_lang, target_lang)
-            elif CONFIG["translate_api"] == "baidu":
+            if CONFIG["translate_api"] == "baidu":
                 return translate_baidu(text, src_lang, target_lang)
             else:
                 raise ValueError("不支持的翻译API")
@@ -73,42 +77,27 @@ def translate_text(text, src_lang='en', target_lang='zh-CN', max_retries=3):
             time.sleep(2 ** attempt)
     return "[翻译失败]"
 
-
-def translate_microsoft(text, src_lang, target_lang):
-    """使用微软翻译API"""
-    endpoint = "https://api.cognitive.microsofttranslator.com/translate"
-    params = {
-        "api-version": "3.0",
-        "from": src_lang,
-        "to": [target_lang]
-    }
-    headers = {
-        "Ocp-Apim-Subscription-Key": CONFIG["microsoft_key"],
-        "Ocp-Apim-Subscription-Region": CONFIG["microsoft_region"],
-        "Content-Type": "application/json"
-    }
-
-    body = [{"text": text}]
-
-    session = requests.Session()
-    if CONFIG["proxy"]:
-        session.proxies = {"https": CONFIG["proxy"]}
-
-    response = session.post(
-        endpoint,
-        params=params,
-        headers=headers,
-        json=body,
-        timeout=CONFIG["request_timeout"]
-    )
-
-    if response.status_code != 200:
-        raise Exception(f"API错误: {response.text}")
-
-    return response.json()[0]["translations"][0]["text"]
-
+LAST_REQUEST_TIME = 0
+REQUEST_INTERVAL = 1.0
 
 def translate_baidu(text, src_lang, target_lang):
+    global LAST_REQUEST_TIME
+    elapsed = time.time() - LAST_REQUEST_TIME
+    if elapsed < REQUEST_INTERVAL:
+        time.sleep(REQUEST_INTERVAL - elapsed)
+    LAST_REQUEST_TIME = time.time()
+    # 参数验证
+    if target_lang.lower() == 'zh-cn':
+        target_lang = 'zh'  # 百度使用zh表示简体中文
+
+    valid_langs = ['zh', 'en', 'jp', 'kor', 'fra', 'ru']
+    if target_lang not in valid_langs:
+        raise ValueError(f"百度不支持的目标语言: {target_lang}")
+
+    # 自动编码处理
+    encoded_text = quote(text, safe='')  # 强制编码特殊字符
+    if len(encoded_text) > 6000:
+        raise ValueError("文本长度超过百度API限制")
     """使用百度翻译API"""
     url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
     salt = str(time.time())
@@ -128,17 +117,34 @@ def translate_baidu(text, src_lang, target_lang):
     if CONFIG["proxy"]:
         session.proxies = {"https": CONFIG["proxy"]}
 
-    response = session.get(
-        url,
-        params=params,
-        timeout=CONFIG["request_timeout"]
-    )
+    try:
+        response = session.get(  # 改为GET请求
+            url,
+            params=params,  # 使用查询参数
+            timeout=(10, 30)
+        )
+        result = response.json()
+        if "error_code" in result:
+            error_code = result["error_code"]
+            error_msg = result.get("error_msg", "未知错误")
+            if error_code in ['54003', '54004', '54005']:  # 频率限制类错误
+                time.sleep(2)
+                return translate_baidu(text, src_lang, target_lang)
+            elif error_code in ['52001', '52002', '52003']:  # 网络相关错误
+                time.sleep(1)
+                return translate_baidu(text, src_lang, target_lang)
+            else:
+                raise ValueError(f"百度API错误 {error_code}: {error_msg}")
 
-    result = response.json()
-    if "error_code" in result:
-        raise Exception(f"API错误: {result}")
+        if "trans_result" not in result:
+            raise ValueError("响应缺少trans_result字段")
 
-    return "\n".join([item["dst"] for item in result["trans_result"]])
+        return "\n".join([item["dst"] for item in result["trans_result"]])
+    except requests.exceptions.Timeout:
+        logging.warning("百度API请求超时，尝试降低并发量")
+        return translate_text(text)
+
+
 def pdf_to_docx_ocr_translate(pdf_path, docx_path, ocr_lang="eng", target_lang="zh-CN",
                               dpi=300, poppler_path=None, tesseract_path=None):
     """
@@ -308,10 +314,31 @@ def add_to_document(doc, img_path, ocr_text, translated_text):
     doc.add_page_break()
 
 
+# 添加密钥验证函数
+def validate_baidu_credentials():
+    test_params = {
+        "q": "test",
+        "from": "en",
+        "to": "zh",
+        "appid": CONFIG["baidu_appid"],
+        "salt": "123456",
+        "sign": hashlib.md5((CONFIG["baidu_appid"] + "test" + "123456" + CONFIG["baidu_secret"]).encode()).hexdigest()
+    }
+
+    response = requests.get("https://fanyi-api.baidu.com/api/trans/vip/translate", params=test_params)
+    result = response.json()
+    if "error_code" in result and result["error_code"] in ['52001', '54000']:
+        raise ValueError("无效的API凭证，请检查appid和secret")
+
 if __name__ == "__main__":
+    try:
+        validate_baidu_credentials()
+    except Exception as e:
+        logging.error(f"API凭证验证失败: {str(e)}")
+        exit(1)
     # 配置路径（根据实际情况修改）
-    input_pdf = r"./Ethereum_Whitepaper_-_Buterin_2014.pdf"
-    output_docx = r"./Ethereum_Whitepaper_Translated.docx"
+    input_pdf = r"./NED-Report-May-June-part-01.pdf"
+    output_docx = r"./NED-Report-May-June-part-01.docx"
     poppler_path = r"D:/poppler-24.08.0/Library/bin"
     tesseract_path = r"D:/Tesseract-OCR/tesseract.exe"
 
